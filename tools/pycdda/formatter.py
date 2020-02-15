@@ -529,10 +529,10 @@ def main(io_mapping: dict, *,
                 output_filename = os.path.devnull
 
             elif output_filename != STDOUT:
-                output_filename = _render_template(config['out_tmpl'], input_file, _tmpl_vars)
+                output_filename = _render_template(config['out_tmpl'], input_file, variables=_tmpl_vars)
 
             if backup:
-                backup_filename = _render_template(config['bkup_tmpl'], input_file, _tmpl_vars)
+                backup_filename = _render_template(config['bkup_tmpl'], input_file, variables=_tmpl_vars)
 
             # check for existing output files
             if os.path.exists(output_filename) and not overwrite:
@@ -669,6 +669,11 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     # check for input/output mismatch
     elif len(args.input) != len(args.output) and args.output and not args.output_template:
         parser.error(f"Number of inputs ({len(args.input)}) does not match outputs ({len(args.output)})")
+
+    # set output to input when overwriting
+    elif args.overwrite and not args.output:
+        for input_file, opts in io_mapping.items():
+            opts.update(outargs(out=input_file))
 
     # normal output mapping
     else:
