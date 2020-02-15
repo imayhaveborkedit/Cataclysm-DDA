@@ -658,7 +658,7 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
     # normal file mapping
     else:
-        io_mapping = {normpath(f) for f in args.input}
+        io_mapping = {normpath(f): outargs() for f in args.input}
 
     ## parse output arguments
     # map stdout
