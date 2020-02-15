@@ -223,8 +223,29 @@ class JSONFormatter:
 
         line_length = self._get_container_width(obj)
         will_wrap = line_length > self.max_line_length or self._depth <= self.always_wrap_depth
+        will_wrap = will_wrap or self._has_wrap_override_key(obj)
 
         return will_wrap
+
+    def _has_wrap_override_key(self, obj: container_types) -> bool:
+        """Determine if a container has a container that will wrap due to an override"""
+
+        if self.no_wrap_overrides:
+            return False
+
+        if isinstance(obj, list):
+            for item in obj:
+                if self._has_wrap_override_key(item):
+                    return True
+
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                if key in self.wrap_overrides and isinstance(value, container_types) and len(value) > 1:
+                    return True
+                elif self._has_wrap_override_key(value):
+                    return True
+
+        return False
 
     @contextlib.contextmanager
     def _write_object(self, *, needs_indent: bool, wrap=False):
@@ -276,17 +297,19 @@ class JSONFormatter:
         """Writes an object kv pair, formatting the value."""
 
         # praise short circuiting
-        if not wrap and not self.no_wrap_overrides and key in self.wrap_overrides and \
-            isinstance(value, container_types) and len(value) > 1:
+        force_wrap = not self.no_wrap_overrides and \
+                     key in self.wrap_overrides and \
+                     isinstance(value, container_types) and \
+                     len(value) > 1
 
-            wrap = True
+        wrap = wrap or force_wrap
 
         if wrap: # We're not inlined so we need an indent
             self._write_to_buffer(self.current_indent)
 
         # ensure that keys are written as strings -----------------vv
         self._write_to_buffer(f'{json.dumps(key, **_json_dump_args)!s}: ')
-        self._write(value, needs_indent=False, is_last=is_last)
+        self._write(value, needs_indent=False, is_last=is_last, force_wrap=force_wrap)
 
         if not is_last:
             self._write_to_buffer(',')
