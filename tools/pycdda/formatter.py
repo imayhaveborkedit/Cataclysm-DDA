@@ -24,6 +24,7 @@ import contextlib
 
 from datetime import datetime
 from ctypes import c_longlong
+from string import ascii_uppercase
 
 
 __all__ = ['JSONFormatter', 'parse_json', 'JSONDecodeError']
@@ -34,6 +35,9 @@ container_types = (dict, list)
 
 json_prim = typing.Union[str, int, float, bool, None]
 json_type = typing.Union[dict, list, json_prim]
+
+int64_max = 2 ** 63 - 1
+int64_min = -2 ** 63
 
 
 class JSONDecodeError(Exception):
@@ -94,7 +98,6 @@ _formatting_choices = {
     'max-line-length': int,
     'wrap-overrides': lambda s: s.split(','),
     'no-wrap-overrides': _isbool,
-    'auto-split-stringarray-lines': _isbool,
     'always-wrap-depth': int,
     'cast-ints': _isbool,
     'round-floats': _isbool,
@@ -149,31 +152,73 @@ class JSONFormatter:
     max_line_length: Optional[int]
     wrap_overrides: Optional[List[str]]
     no_wrap_overrides: Optional[bool]
-    autosplit: Optional[bool]
     cast_ints: Optional[bool]
     round_floats: Optional[bool]
     debug: Optional[bool]
+
+    Attributes
+    -----------
+    file: Optional[str]
+    warning_count: int
     """
 
     default_wrap_overrides = ('rows', 'blueprint')
 
-    def __init__(self, **kwargs):
+    def __init__(self, file=None, **kwargs):
+        self.file = file
+
         self.indent_width      = kwargs.pop('indent_width', 2)
         self.max_line_length   = kwargs.pop('max_line_length', 120)
         self.wrap_overrides    = kwargs.pop('wrap_overrides', self.default_wrap_overrides)
         self.no_wrap_overrides = kwargs.pop('no_wrap_overrides', False)
-        self.autosplit         = kwargs.pop('autosplit', False)
         self.always_wrap_depth = kwargs.pop('always_wrap_depth', 1)
         self.cast_ints         = kwargs.pop('cast_ints', True)
         self.round_floats      = kwargs.pop('round_floats', True)
         self.debug             = kwargs.pop('debug', False)
 
+        w_all = kwargs.pop('warn_all', False)
+        self.warn_stringarray_spaces = w_all or kwargs.pop('warn_stringarray_spaces', False)
+        self.warn_long_list_item     = w_all or kwargs.pop('warn_long_list_item', False)
+        self.warn_int_wraparound     = w_all or kwargs.pop('warn_int_wraparound', False)
+        self.warn_float_rounding     = w_all or kwargs.pop('warn_float_rounding', False)
+
+        self.warning_count = 1
+
         self._depth = 0
         self._buffer = io.StringIO()
+
+    @property
+    def current_indent(self) -> str:
+        """Returns indentation for the current depth."""
+        return ' ' * self.indent_width * self._depth
 
     def _dbug(self, *args, file=sys.stderr, **kwargs):
         if self.debug:
             print(*args, file=file, **kwargs)
+
+    def _warn(self, obj: json_type, message: str):
+        lines = self._buffer.getvalue().splitlines()
+        lineno = len(lines)
+
+        data_text = 'entity in question:'
+        objrepr = f'"{obj}"' if isinstance(obj, str) else repr(obj)
+
+        context = '\n'.join(f'|{l}' for l in lines[-3:]).rstrip('\n')
+
+        pointer = '^'
+        pointer_offset = len(lines[-1])+1
+        pointer_width = len(objrepr)-1
+
+        mesg_line =  "@ {self.file}:~{lineno}:~{pointer_offset}: warning[{self.warning_count}]: {message}"
+        data_line =  "? {data_text} {objrepr}"
+        ctx_lines =  "{context}{objrepr}"
+        mark_line =  "|{pointer: >{pointer_offset}}{pointer:{pointer}>{pointer_width}}"
+
+        _locals = locals()
+        warn_msg = '\n'.join(l.format(**_locals) for l in (mesg_line, ctx_lines, mark_line))
+
+        print(warn_msg, file=sys.stderr)
+        self.warning_count += 1
 
     def _reset(self):
         self._depth = 0
@@ -181,11 +226,6 @@ class JSONFormatter:
 
     def _write_to_buffer(self, text: str):
         self._buffer.write(text)
-
-    @property
-    def current_indent(self) -> str:
-        """Returns indentation for the current depth."""
-        return ' ' * self.indent_width * self._depth
 
     def _get_container_width(self, obj: container_types) -> int:
         """Returns the width of a formatted json object or array from a dict or list."""
@@ -324,11 +364,23 @@ class JSONFormatter:
             if needs_indent:
                 self._write_to_buffer(self.current_indent)
 
-            if self.cast_ints and isinstance(obj, int) and not isinstance(obj, bool):
-                obj = c_longlong(obj).value
+            # int wraparound warning and format option
+            if isinstance(obj, int) and not isinstance(obj, bool):
+                if self.warn_int_wraparound and not int64_min <= obj <= int64_max:
+                    tense = 'will' if self.cast_ints else 'would'
+                    self._warn(obj, f"integer value {tense} wraparound")
 
-            elif self.round_floats and isinstance(obj, float):
-                obj = round(obj, 6)
+                if self.cast_ints:
+                    obj = c_longlong(obj).value
+
+            # float rounding warning and format option
+            elif isinstance(obj, float):
+                if self.warn_float_rounding and str(obj) != str(round(obj, 6)):
+                    tense = 'will' if self.round_floats else 'would'
+                    self._warn(obj, f"float value {tense} be rounded")
+
+                if self.round_floats:
+                    obj = round(obj, 6)
 
             self._write_to_buffer(json.dumps(obj, **_json_dump_args))
 
@@ -369,13 +421,25 @@ class JSONFormatter:
 
                 self._write_to_buffer('\n' if wrap else ' ')
 
-                if self.autosplit and len(obj) == 1 and isinstance(obj[0], str):
-                    _text = obj.pop()
-                    obj.extend(textwrap.wrap(text, self.max_line_length, break_on_hyphens=False))
-
                 objlen = len(obj)
+                is_stringarray = all(isinstance(i, str) for i in obj)
 
                 for i, item in enumerate(obj, 1):
+                    # process warnings inside loop to avoid iterating over it multiple times
+                    if (self.warn_long_list_item or self.warn_stringarray_spaces) and isinstance(item, str):
+                        # long-list-item check
+                        if objlen == 1:
+                            if len(obj[0]) > self.max_line_length:
+                                self._warn(item, f"list item {i} is a very long string ({len(item)})")
+
+                        # stringarray-spaces check
+                        elif is_stringarray and i < objlen: # don't care about checking the last line
+                            # i is offset+1 so it means the next line
+                            if (item.endswith('.') and obj[i][0] in ascii_uppercase) or \
+                               (item.endswith(',') and obj[i][0] != ' '):
+
+                                self._warn(item, f"stringarray item {i} may lack a trailing space")
+
                     self._write(item, needs_indent=wrap, is_last=i == objlen)
 
                     # I hate 4-way conditionals
@@ -383,7 +447,6 @@ class JSONFormatter:
                         self._write_to_buffer('\n' if wrap else ' ')
                     else:
                         self._write_to_buffer(',\n' if wrap else ', ')
-
 
     def format_json(self, data: json_type) -> str:
         """Main entry point. Returns a formatted json string from a json-compatible python object."""
@@ -409,10 +472,6 @@ def parse_json(data:str, source='<string>', *, unique_key_hook=True) -> json_typ
         empty_header    =  "     {0: >{1}} "
         pointer_header  = f"{'^': >{e.colno}}"
         error_header    = f"Syntax error: {e.msg}"
-
-        # I wasted so much time on this one function and I don't even need it ;_;
-        # def choose_lines(lineno, lines):
-        #     return max(0, lineno-3), min(lineno+2, len(lines)), lines[max(0, lineno-3):min(lineno+2, len(lines))]
 
         # Pick the lines of the input data to display
         start_line = max(0, e.lineno-3) + 1
@@ -453,11 +512,11 @@ def main(io_mapping: dict, *,
 
     STDIN = STDOUT = '-'
 
-    # Extra flag consistancy logic, can change to raise errors instead
+    # Extra flag consistancy logic, can change later to raise errors instead
     if parse:
         diff = False
         formatter = []
-        warnings = [] # TODO: allow parse with warnings
+        warnings = []
 
     if quiet:
         verbose = False
@@ -505,6 +564,12 @@ def main(io_mapping: dict, *,
         k, v = kv[0].split('=')
         formatter_kwargs[k.replace('-','_')] = _formatting_choices[k](v)
 
+    # translate warning list into kwargs
+    if ['all'] in warnings:
+        warnings_kwargs = {'warn_all': True}
+    else:
+        warnings_kwargs = {'warn_'+kw[0].replace('-','_'): True for kw in warnings}
+
     static_vars = _static_template_vars()
 
     # main run loop
@@ -533,9 +598,10 @@ def main(io_mapping: dict, *,
                 progress['pass'] += 1
                 continue
 
-            # TODO: impl warnings
             # actually run the formatter
-            result = formatted_json = JSONFormatter(**formatter_kwargs).format_json(json_data)
+            result = formatted_json = JSONFormatter(input_file,
+                                                    **formatter_kwargs,
+                                                    **warnings_kwargs).format_json(json_data)
 
             # generate the format template variables
             _tmpl_vars = {
@@ -655,18 +721,13 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         opt, value = arg.split('=')
 
         if opt not in _formatting_choices:
-            parser.error(f"{opt!r} is not a valid formatter choice (from argument {arg!r})")
+            parser.error(f"{opt!r} is not a valid formatter option (from argument {arg!r})")
 
     for arg in args.warnings:
-        arg = arg[0]
-
-        if '=' not in arg:
-            parser.error(f"Malformed warning argument: {arg}")
-
-        opt, value = arg.split('=')
+        opt = arg[0]
 
         if opt not in _warning_choices:
-            parser.error(f"{opt!r} is not a valid warning choice (from argument {arg!r})")
+            parser.error(f"{opt!r} is not a valid warning option (from argument {arg!r})")
 
     ## parse input arguments
     # map stdin
@@ -692,6 +753,10 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     # check for input/output mismatch
     elif len(args.input) != len(args.output) and args.output and not args.output_template:
         parser.error(f"Number of inputs ({len(args.input)}) does not match outputs ({len(args.output)})")
+
+    # overwrite and template options conflict
+    elif args.overwrite and args.output_template:
+        parser.error("-r/--overwrite and -T/--output-template options are mutually exclusive")
 
     # set output to input when overwriting
     elif args.overwrite and not args.output:
@@ -782,9 +847,6 @@ Formatter arguments
   no-wrap-overrides=false
     Disables the behavior of wrap-overrides
 
-  auto-split-stringarray-lines=false
-    Automatically split long strings in arrays containing a single string
-
   always-wrap-depth=1
     Unconditionally wrap containers at this depth regardless of contents
 
@@ -795,27 +857,51 @@ Formatter arguments
     Round floats to 6 decimal places
 
 
+Formatter argument typing
+==========================
+
+  There are three types that a formatter argument can be passed as:
+
+    integer:
+      a typical positive or negative integer value
+        note: negative values are not actually valid for any integer option
+
+    bool:
+      any of the following values without regard to case are considered
+      true while anything else is considered false:
+
+        y, yes, true, 1
+
+    list:
+      a comma delimited list of string arguments
+        note: quote the entire argument to use spaces, i.e. "-F a=x y,z"
+
 Warning arguments
 ==================
 
-  This feature is not yet implemented.
+  -W/--warnings arguments are passed as-is, as they are toggles, i.e.
+
+    {_file_} -W int-wraparound -W float-rounding -i ...
+
+  all
+    Enable all warnings
+
+  stringarray-spaces
+    Warn if:
+      - line n ends with a period and line n+1 starts with an uppercase letter
+      OR
+      - line n ends with a comma and line n+1 does not start with a space
+
+  long-list-item:
+    Warn if a list with a single item is longer than the length limit
+
+  int-wraparound:
+    Warn if an int may overflow or underflow when cast to longlong (int64)
+
+  float-rounding:
+    Warn if a float has more than 6 decimal places of precision
 
 """
-    # TODO: move to epilog
-    # all:
-    #   enable all warnings
-    #
-    # stringarray-spaces:
-    #   warn if there is no space (without period) at the end of a string in a stringarray
-    #
-    # long-list-item:
-    #   warn if a list with a single item is longer than the length limit (may be a stringarray)
-    #
-    # int-wraparound:
-    #   warn if an int may overflow or underflow when cast to longlong (int64)
-    #
-    # float-rounding:
-    #   warn if a float has more than 6 decimal places of precision
 
     parser = argparse.ArgumentParser(prog=_file_, add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
