@@ -66,16 +66,17 @@ class _commentstr(bytes):
         return super().__hash__()
 
     def __len__(self):
-        return 2
+        return len(self.rsplit(b'_', 1)[0])
 
     def __eq__(self, other):
-        return other == '//'
+        other = other.encode() if isinstance(other, str) else other
+        return super().__eq__(other)
 
 def _commentstr_hook(pairs):
     com_count = 0
     for i, (k, v) in enumerate(pairs):
-        if k == '//':
-            pairs[i] = (_commentstr(f'{k}{com_count}'), v)
+        if k.startswith('//'):
+            pairs[i] = (_commentstr(f'{k}_{com_count}'), v)
             com_count += 1
 
     return dict(pairs)
@@ -83,7 +84,7 @@ def _commentstr_hook(pairs):
 class _SpecialEncoder(json.JSONEncoder):
     def default(self, o):
         if isinstance(o, _commentstr):
-            return '//'
+            return o.rsplit(b'_', 1)[0].decode('utf8')
         return super().default(o)
 
 _json_dump_args = {
@@ -132,7 +133,7 @@ def _dynamic_template_vars(file:str) -> dict:
         'sep': os.path.sep,
         'cwd': path.cwd(),
         'home': path.home(),
-        'stat': path.stat(),
+        'stat': path.stat() if file != '-' else os.stat(0),
         'input_pos': -1, # via kwargs
         'input_total': -1 # via kwargs
     }
@@ -495,6 +496,7 @@ def parse_json(data:str, source='<string>', *, unique_key_hook=True) -> json_typ
                                             error_header))
 
         raise JSONDecodeError(str(e), complete_error_message, e) from None
+        # TODO: consider termsize with long lines
 
 def main(io_mapping: dict, *,
          output_template: typing.Optional[str],
@@ -688,7 +690,7 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         parser.print_help()
         exit(0)
 
-    elif args.short_help:
+    elif args.short_help or not args.input:
         parser.print_help()
         exit(0)
 
@@ -737,7 +739,7 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     # expand globs
     elif args.glob:
         for input_arg in args.input:
-            for f in glob.glob(input_arg):
+            for f in glob.iglob(input_arg, recursive=True):
                 io_mapping[normpath(f)] = outargs()
 
     # normal file mapping
@@ -772,7 +774,6 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
 
 
 if __name__ == '__main__':
-    _file_ = os.path.basename(__file__)
     _warning_arg_list = '\n'.join(textwrap.wrap(', '.join(_warning_choices), 78,
                                                 break_on_hyphens=False,
                                                 subsequent_indent=' '*6))
@@ -787,9 +788,10 @@ Template variables
   and datetime variables.  This option can be used to route output files
   into specific folders or for name sorting purposes.  For example:
 
-    {_file_} -B "{{parent}}/{{unixtime:.0f}}/{{input_pos}}_{{filename}}" ...
+    -B '{{parent}}/{{unixtime:.0f}}/{{input_pos}}_{{filename}}'
 
-  bob@foo:~/cdda/data$ python3 tools/{_file_} -i json/skills.json ...
+  [TODO: ensure these are correct with the new cli style]
+  bob@foo:~/cdda/tools$ %(prog)s -i json/skills.json ...
 
   |   variable  |   type   |         example data         | note |
   |-------------|----------|------------------------------|------|
@@ -800,10 +802,10 @@ Template variables
   | path        | string   | json/skills.json             | [1]  |
   | abs_path    | string   | /home/(...)/json/skills.json | [2]  |
   | parent      | string   | /home/bob/cdda/data/json     |      |
-  | sep         | string   | / (on nix)  \\ (on win)      |      |
-  | cwd         | string   | /home/bob/cdda/data          |      |
+  | sep         | string   | / (on nix)  \ (on win)       |      |
+  | cwd         | string   | /home/bob/cdda/tools         |      |
   | home        | string   | /home/bob                    | [3]  |
-  | stat        | stat     | (see note below)             | [4]  |
+  | stat        | stat     | (see note)                   | [4]  |
   | unixtime    | float    | 1581670653.0311236           | [5]  |
   | datetime    | datetime | 2020-02-14_03.57.33          | [6]  |
   | utcdatetime | datetime | (same as above)              | [7]  |
@@ -812,12 +814,12 @@ Template variables
 
   [1] same as input
   [2] absolute path of input file
-  [3] same as $HOME or %HOMEPATH%
+  [3] same as $HOME or %%HOMEPATH%%
   [4] an os.stat_result object, access the stat struct fields via
       dot access, i.e. {{stat.st_size}}
   [5] use a precision specifier for an int value, i.e. {{unixtime:.0f}}
   [6] a datetime.datetime object, use strftime variables, i.e.
-      {{:%Y-%m-%d_%H.%M.%S}}
+      {{:%%Y-%%m-%%d_%%H.%%M.%%S}}
   [7] same as above, but in UTC instead of local time
   [8] position of file in input queue
   [9] total number of inputs in queue
@@ -828,7 +830,7 @@ Formatter arguments
 
   -F/--formatter arguments are passed in 'arg=value' format, i.e.
 
-    {_file_} -F cast-ints=true -i ...
+    -F cast-ints=true
 
   These options will change the formatting rules and alter the output
   based on the given values.  The default values represent their type
@@ -874,14 +876,14 @@ Formatter argument typing
 
     list:
       a comma delimited list of string arguments
-        note: quote the entire argument to use spaces, i.e. "-F a=x y,z"
+        note: quote the entire argument to use spaces, i.e. -F 'a=x y,z'
 
 Warning arguments
 ==================
 
   -W/--warnings arguments are passed as-is, as they are toggles, i.e.
 
-    {_file_} -W int-wraparound -W float-rounding -i ...
+    -W int-wraparound -W float-rounding
 
   all
     Enable all warnings
@@ -903,7 +905,9 @@ Warning arguments
 
 """
 
-    parser = argparse.ArgumentParser(prog=_file_, add_help=False,
+    # TODO: add smartquote fixing formatter arg
+
+    parser = argparse.ArgumentParser(prog='python3 -m pycdda.formatter', add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Reformat json to comply with C:DDA formatting standards. "
                     "Run with --help for more information.")
@@ -982,7 +986,11 @@ Warning arguments
                              "input. This option is not required when using an output template or "
                              "overwrite mode. Pass - to write to stdout")
 
-    argv = sys.argv[1:]
+    argv = list(sys.argv[1:])
+
+    if not argv:
+        parser.print_usage()
+        exit(1)
 
     try:
         args = parser.parse_args(argv)
