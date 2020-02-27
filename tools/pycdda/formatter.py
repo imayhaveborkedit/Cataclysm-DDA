@@ -138,10 +138,22 @@ def _dynamic_template_vars(file:str) -> dict:
         'input_total': -1 # via kwargs
     }
 
-def _render_template(template:str, file:str,*, variables:dict=None) -> str:
+def _render_template(template:str, file:str, *, variables:dict=None) -> str:
     if not variables:
         variables = {**_dynamic_template_vars(file), **_static_template_vars()}
     return template.format(**variables)
+
+def _wrap(text:str, x:int=None, *, indent=0, **kwargs) -> str:
+    if x is None or x <= 0:
+        x = shutil.get_terminal_size().columns - 2
+
+    kwargs.setdefault('subsequent_indent', ' '*indent)
+    _kwargs = {
+        'break_on_hyphens': False,
+        **kwargs
+    }
+
+    return '\n'.join(textwrap.wrap(text, x, **kwargs))
 
 
 class JSONFormatter:
@@ -478,6 +490,10 @@ def parse_json(data:str, source='<string>', *, unique_key_hook=True) -> json_typ
         start_line = max(0, e.lineno-3) + 1
         displayed_lines = json_lines[start_line-1:e.lineno]
 
+        # TODO: shift lines over to the longest line or wrap pointer
+        #       in the case of a long line, truncate lines with `: ` and `:+`
+        #       or if the target line is a long line, shift them over and prepend `:`
+
         # lengthen the pointer line
         longest_num_len = len(str(e.lineno))
         arrow_header_len = len(arrow_header.format(e.lineno, longest_num_len))
@@ -496,9 +512,8 @@ def parse_json(data:str, source='<string>', *, unique_key_hook=True) -> json_typ
                                             error_header))
 
         raise JSONDecodeError(str(e), complete_error_message, e) from None
-        # TODO: consider termsize with long lines
 
-def main(io_mapping: dict, *,
+def run_main(io_mapping: dict, *,
          output_template: typing.Optional[str],
          backup_template: typing.Optional[str],
          backup: bool,
@@ -647,7 +662,12 @@ def main(io_mapping: dict, *,
                     print_mesg(result)
                 else:
                     progress['pass'] += 1
-                    print_mesg(f"File {input_file} is properly formatted.")
+
+                    total = progress['total']
+                    current = total - progress['remaining'] + 1
+                    counter = f"[{current: >{len(str(total))}}/{total}]"
+
+                    print_mesg(f"{counter} File {input_file} is properly formatted.")
 
             if backup and input_file != STDIN:
                 try:
@@ -674,6 +694,9 @@ def main(io_mapping: dict, *,
         finally:
             progress['remaining'] -= 1
 
+    if overwrite:
+        del progress['exists']
+
     if parse:
         print_mesg(', '.join(f'{s}: {n}' for s, n in progress.items() if s in ['pass', 'error']))
 
@@ -695,14 +718,14 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         exit(0)
 
     # helper functions
-    def normpath(path):
+    def normpath(path) -> str:
         if not path:
             return path
         if '~' in path:
             path = os.path.expanduser(path)
         return os.path.normpath(path)
 
-    def outargs(**kwargs):
+    def outargs(**kwargs) -> dict:
         out_tmpl = kwargs.get('out_tmpl') or args.output_template or _default_output_template
         bkup_tmpl = kwargs.get('bkup_tmpl') or args.backup_template or _default_backup_template
         return {
@@ -773,10 +796,7 @@ def parse_arguments(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     return io_mapping
 
 
-if __name__ == '__main__':
-    _warning_arg_list = '\n'.join(textwrap.wrap(', '.join(_warning_choices), 78,
-                                                break_on_hyphens=False,
-                                                subsequent_indent=' '*6))
+def main(argv=None):
     long_epilog = f"""\
 
 Template variables
@@ -904,89 +924,95 @@ Warning arguments
     Warn if a float has more than 6 decimal places of precision
 
 """
-
     # TODO: add smartquote fixing formatter arg
 
-    parser = argparse.ArgumentParser(prog='python3 -m pycdda.formatter', add_help=False,
+    _warning_arg_list = _wrap(', '.join(_warning_choices), indent=6)
+    _warning_arg_list = '\n'.join(textwrap.wrap(', '.join(_warning_choices), 78,
+                                                break_on_hyphens=False,
+                                                subsequent_indent=' '*6))
+
+    parser = argparse.ArgumentParser(prog=f'python3 -m {__spec__.name}', add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Reformat json to comply with C:DDA formatting standards. "
-                    "Run with --help for more information.")
+        description=_wrap("Reformat json to comply with C:DDA formatting standards.  "
+                          "Run with --help for more information."))
 
     parser.long_epilog = long_epilog
 
     # short help
     parser.add_argument('-h', action='store_true', dest='short_help',
-                        help="show a short help message and exit")
+                        help="Show a short help message and exit")
 
     # long help
     parser.add_argument('--help', action='store_true', dest='long_help',
-                        help="show a long help message and exit")
+                        help="Show a long help message and exit")
 
     # edit in place (atomic replace)
     parser.add_argument('-r', '--overwrite', action='store_true',
-                        help="write output to the source file (backup files will always be overwritten")
+                        help="Write output to the source file (backup files will always be overwritten")
 
     # keep original as copy/backup
     parser.add_argument('-b', '--backup', action='store_true',
-                        help="keep a backup copy of the inputs")
+                        help="Keep a backup copy of the inputs")
 
     # backup name template
     parser.add_argument('-B', '--backup-template',
-                        help="format template for backup filenames; see --help for variables")
+                        help="Format template for backup filenames; see --help for variables")
 
     # debug logging (change to loglevel style?)
     parser.add_argument('-V', '--verbose', action='store_true',
-                        help="print debug information to stderr")
+                        help="Print debug information to stderr")
 
     # quiet output
     parser.add_argument('-q', '--quiet', action='store_true',
-                        help="do not print any extraneous messages")
+                        help="Keep console output to a minimum")
 
     # ignore read errors from multiple inputs? -c, --continue
     parser.add_argument('-c', '--continue', action='store_true', dest='continue_on_err',
-                        help="continue processing inputs when an error is encountered")
+                        help="Continue processing inputs when an error is encountered")
 
     # parse input, only checking for syntax errors
     parser.add_argument('-p', '--parse', action='store_true',
-                        help="only check input for syntax errors")
+                        help="Only check input for syntax errors")
 
     # parse input, reformats it, and checks for diffs
     parser.add_argument('-d', '--diff', action='store_true',
-                        help="Verify that the input json matches the formatted output json. "
-                             "Instead of formatted json being written to output files, a "
-                             "diff is generated and written instead; implies -c")
+                        help=_wrap("Verify that the input json matches the formatted output json.  "
+                                   "Instead of formatted json being written to output files, a "
+                                   "diff is generated and written instead; implies -c"))
 
     # show/hide warnings i.e. -W all
     parser.add_argument('-W', '--warnings', action='append', nargs=1, default=[],
                         # choices=_warning_choices,
-                        help="emit specified warnings during formatting for potential issues; see --help")
+                        help="Emit specified warnings during formatting for potential issues; see --help")
 
     # formatting options
     parser.add_argument('-F', '--formatter', action='append', nargs='+', default=[],
                         # choices=_formatting_choices,
-                        help="enable specific formatting tweaks; see --help")
+                        help="Enable specific formatting tweaks; see --help")
 
     # glob input flag
     parser.add_argument('-g', '--glob', action='store_true',
-                        help="use glob matching for input parsing")
+                        help="Use glob matching for input parsing")
 
     # input filename(s), read from stdin with `-`
     parser.add_argument('-i', dest='input', nargs='+',
-                        help="one or more filenames to read from; pass - to read from stdin")
+                        help="One or more filenames to read from; pass - to read from stdin")
 
     # output name template (%n_new.json) etc
     parser.add_argument('-T', '--output-template',
-                        help="format template for ouput filenames; see --help for variables")
+                        help="Format template for ouput filenames; see --help for variables")
 
     # output filename, output to stdout with `-`
     # if taking multiple inputs and input/output counts don't match: error
     parser.add_argument('-o', dest='output', nargs='*', default=[],
-                        help="Zero or more filenames to write to. The number of output arguments "
-                             "must match the number of input arguments if there is more than one "
-                             "input. This option is not required when using an output template or "
-                             "overwrite mode. Pass - to write to stdout")
+                        help=_wrap("Zero or more filenames to write to.  The number of output arguments "
+                                   "must match the number of input arguments if there is more than one "
+                                   "input.  This option is not required when using an output template or "
+                                   "overwrite mode.  Pass - to write to stdout"))
+    if argv is None:
+        argv = sys.argv[1:]
 
-    argv = list(sys.argv[1:])
+    argv = list(argv)
 
     if not argv:
         parser.print_usage()
@@ -999,4 +1025,8 @@ Warning arguments
         e.code = e.code and 1 # short circuit on falsy trick
         raise e from None
 
-    main(io_mapping, **vars(args))
+    run_main(io_mapping, **vars(args))
+
+
+if __name__ == '__main__':
+    main()
