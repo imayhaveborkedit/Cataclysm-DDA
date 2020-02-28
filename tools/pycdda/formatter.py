@@ -1,9 +1,36 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
 """
-Port of json linter (tools/format/format.cpp) in python
-Original linter: http://dev.narc.ro/cataclysm/format.html
-with source at: https://github.com/CleverRaven/Cataclysm-DDA/blob/master/tools/format/format.cpp
+The MIT License (MIT)
+
+Copyright (c) 2020 Imayhaveborkedit
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+
+Port of the json linter/formatter in python
+
+Original linter:
+  http://dev.narc.ro/cataclysm/format.html
+Source:
+  https://github.com/CleverRaven/Cataclysm-DDA/blob/master/tools/format/format.cpp
 """
 
 import io
@@ -19,36 +46,26 @@ import typing
 import difflib
 import pathlib
 import argparse
-import textwrap
 import contextlib
 
 from datetime import datetime
 from ctypes import c_longlong
 from string import ascii_uppercase
 
-
-__all__ = ['JSONFormatter', 'parse_json', 'JSONDecodeError']
-
-
-prim_types = (str, int, float, bool)
-container_types = (dict, list)
-
-json_prim = typing.Union[str, int, float, bool, None]
-json_type = typing.Union[dict, list, json_prim]
-
-int64_max = 2 ** 63 - 1
-int64_min = -2 ** 63
+from . import parser
+from .utils import (
+    prim_types,
+    container_types,
+    json_prim,
+    json_type,
+    int64_max,
+    int64_min,
+    wrap as _wrap
+)
 
 
-class JSONDecodeError(Exception):
-    def __init__(self, msg, formatted_msg, original=None):
-        super().__init__(msg)
-        self.formatted_msg = formatted_msg
-        self.original = original
+__all__ = ['JSONFormatter']
 
-    def print_error(self, *, file=sys.stderr, **kwargs):
-        """Prints a nicely formatted message indicating the error."""
-        print(self.formatted_msg, file=file, **kwargs)
 
 # These next three things are used for ensuring multiple comment keys in
 # the same json object persist after being loaded.  Since python dicts
@@ -142,18 +159,6 @@ def _render_template(template:str, file:str, *, variables:dict=None) -> str:
     if not variables:
         variables = {**_dynamic_template_vars(file), **_static_template_vars()}
     return template.format(**variables)
-
-def _wrap(text:str, x:int=None, *, indent=0, **kwargs) -> str:
-    if x is None or x <= 0:
-        x = shutil.get_terminal_size().columns - 2
-
-    kwargs.setdefault('subsequent_indent', ' '*indent)
-    _kwargs = {
-        'break_on_hyphens': False,
-        **kwargs
-    }
-
-    return '\n'.join(textwrap.wrap(text, x, **kwargs))
 
 
 class JSONFormatter:
@@ -470,49 +475,6 @@ class JSONFormatter:
         return self._buffer.getvalue()
 
 
-def parse_json(data:str, source='<string>', *, unique_key_hook=True) -> json_type:
-    """Like json.loads, but with a fancy exception for parsing errors."""
-
-    try:
-        return json.loads(data, object_pairs_hook=_commentstr_hook if unique_key_hook else None)
-    except json.JSONDecodeError as e:
-        json_lines = data.split('\n')
-
-        location = source if source[0] == '<' else f'"{source}"'
-
-        location_header = f"File {location}, line {e.lineno}, column {e.colno} (char {e.pos})"
-        arrow_header    =  "---> {0: >{1}} "
-        empty_header    =  "     {0: >{1}} "
-        pointer_header  = f"{'^': >{e.colno}}"
-        error_header    = f"Syntax error: {e.msg}"
-
-        # Pick the lines of the input data to display
-        start_line = max(0, e.lineno-3) + 1
-        displayed_lines = json_lines[start_line-1:e.lineno]
-
-        # TODO: shift lines over to the longest line or wrap pointer
-        #       in the case of a long line, truncate lines with `: ` and `:+`
-        #       or if the target line is a long line, shift them over and prepend `:`
-
-        # lengthen the pointer line
-        longest_num_len = len(str(e.lineno))
-        arrow_header_len = len(arrow_header.format(e.lineno, longest_num_len))
-        complete_pointer_header = ' ' * arrow_header_len + pointer_header
-
-        completed_displayed_lines = []
-
-        # Combine line numbers and data lines
-        for line_no, line in enumerate(displayed_lines, start_line):
-            header = arrow_header if line_no == e.lineno else empty_header
-            completed_displayed_lines.append(header.format(line_no, longest_num_len)+line)
-
-        complete_error_message = '\n'.join((location_header,
-                                            *completed_displayed_lines,
-                                            complete_pointer_header,
-                                            error_header))
-
-        raise JSONDecodeError(str(e), complete_error_message, e) from None
-
 def run_main(io_mapping: dict, *,
          output_template: typing.Optional[str],
          backup_template: typing.Optional[str],
@@ -603,8 +565,8 @@ def run_main(io_mapping: dict, *,
         try:
             # Load json and parse for syntax errors
             try:
-                json_data = parse_json(data, source)
-            except JSONDecodeError as err:
+                json_data = parser.parse_json(data, source, object_pairs_hook=_commentstr_hook)
+            except parser.JSONDecodeError as err:
                 progress['error'] += 1
                 err.print_error()
                 maybe_exit(2)
@@ -927,9 +889,6 @@ Warning arguments
     # TODO: add smartquote fixing formatter arg
 
     _warning_arg_list = _wrap(', '.join(_warning_choices), indent=6)
-    _warning_arg_list = '\n'.join(textwrap.wrap(', '.join(_warning_choices), 78,
-                                                break_on_hyphens=False,
-                                                subsequent_indent=' '*6))
 
     parser = argparse.ArgumentParser(prog=f'python3 -m {__spec__.name}', add_help=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
